@@ -8,231 +8,161 @@ import "@superfluid-finance/ethereum-contracts/contracts/interfaces/misc/IResolv
 import {ISuperAgreement, SuperAppDefinitions, ISuperfluid, ISuperToken, ISuperTokenFactory} from "@superfluid-finance/ethereum-contracts/contracts/interfaces/superfluid/ISuperfluid.sol";
 import {ERC20WithTokenInfo, TokenInfo} from "@superfluid-finance/ethereum-contracts/contracts/interfaces/tokens/ERC20WithTokenInfo.sol";
 
-contract YourContract is SuperAppBase {
+import "hardhat/console.sol";
+
+contract YourContract {
+    /**************************************************************************
+     Fields
+     *************************************************************************/
+    struct DAOReceiver {
+        address receiverAddress;
+        uint8 receiverWeight;
+    }
+
+    uint8 public totalReceivers;
+    uint16 public totalWeight;
+    uint8 public burnPercentage;
+
+    uint96 private _secondsPerYear = 31557600;
+
+    function setBurnPercentage(uint8 newPercentage) public {
+        require(newPercentage > 0, "Have to give at least something out");
+        require(newPercentage < 100, "Can't spend everything");
+        burnPercentage = newPercentage;
+    }
+
+    mapping(uint8 => DAOReceiver) public payroll;
+    mapping(address => uint8) private indices;
+
+    // Superfluid
     ISuperfluid private _host; // host
     IConstantFlowAgreementV1 private _cfa; // the stored constant flow agreement class address
     ISuperToken private _acceptedToken; // accepted token
     address private _receiver;
-    ISuperToken private _sodaToken;
 
     constructor(
         ISuperfluid host,
         IConstantFlowAgreementV1 cfa,
-        ISuperToken acceptedToken,
-        ISuperToken sodaToken
+        ISuperToken acceptedToken
     ) {
         assert(address(host) != address(0));
         assert(address(cfa) != address(0));
         assert(address(acceptedToken) != address(0));
-        assert(address(sodaToken) != address(0));
         _host = host;
         _cfa = cfa;
         _acceptedToken = acceptedToken;
-        _sodaToken = sodaToken;
-        uint256 configWord = SuperAppDefinitions.APP_LEVEL_FINAL |
-            SuperAppDefinitions.BEFORE_AGREEMENT_CREATED_NOOP |
-            SuperAppDefinitions.BEFORE_AGREEMENT_UPDATED_NOOP |
-            SuperAppDefinitions.BEFORE_AGREEMENT_TERMINATED_NOOP;
-        _host.registerApp(configWord);
+
+        totalReceivers = 0;
+        totalWeight = 0;
+    }
+
+    /**************************************************************************
+     Treasury
+     *************************************************************************/
+
+    function TreasuryBalance() public view returns (int256 balance) {
+        (
+            int256 availableBalance,
+            uint256 deposit,
+            uint256 owedDeposit,
+            uint256 timestamp
+        ) = _acceptedToken.realtimeBalanceOfNow(address(this));
+        return availableBalance;
     }
 
     /**************************************************************************
      Managing Payroll
      *************************************************************************/
 
-    struct EntityStruct {
-        uint256 entityData;
-        bool isEntity;
+    // This functio adds an address to the payroll of the dao
+    function addAddressToPayroll(address newAddress, uint8 weight) public {
+        DAOReceiver storage newReceiver = payroll[totalReceivers];
+        indices[newAddress] = totalReceivers;
+        totalReceivers = totalReceivers + 1;
+        // check that weight does not get to big and maybe rebalance
+        totalWeight = totalWeight + weight;
+        newReceiver.receiverAddress = newAddress;
+        newReceiver.receiverWeight = weight;
+        _createFlow(newAddress, 1);
+        recalculateFlow();
     }
 
-    mapping(address => EntityStruct) public entityStructs;
-    uint256 currentEntityCount;
+    // This function removes an address from the payroll of the dao
+    function removeAddressFromPayroll(address removeAddress) public {
+        uint8 index = indices[removeAddress]; // get the index of this address
+        _deleteFlow(removeAddress);
 
-    function isEntity(address entityAddress)
-        public
-        view
-        returns (bool isIndeed)
-    {
-        return entityStructs[entityAddress].isEntity;
+        DAOReceiver memory removedReceiver = payroll[index];
+        totalReceivers = totalReceivers - 1;
+        totalWeight = totalWeight - removedReceiver.receiverWeight;
+        // if we were not looking at the last one we need to swap
+        if (index != totalReceivers) {
+            DAOReceiver memory lastReceiver = payroll[totalReceivers];
+            payroll[index] = payroll[totalReceivers]; // write down the last recipient
+            indices[lastReceiver.receiverAddress] = index; // update our index
+        }
+        recalculateFlow();
     }
 
-    function numberOfEntitie() public view returns (uint256 entityCount) {
-        return currentEntityCount;
-    }
-
-    function newEntity(address entityAddress, uint256 entityData)
-        public
-        returns (bool success)
-    {
-        if (isEntity(entityAddress)) revert();
-        entityStructs[entityAddress].entityData = entityData;
-        entityStructs[entityAddress].isEntity = true;
-        currentEntityCount = currentEntityCount + 1;
-        return true;
-    }
-
-    function deleteEntity(address entityAddress) public returns (bool success) {
-        if (!isEntity(entityAddress)) revert();
-        entityStructs[entityAddress].isEntity = false;
-        currentEntityCount = currentEntityCount - 1;
-        return true;
-    }
-
-    function updateEntity(address entityAddress, uint256 entityData)
-        public
-        returns (bool success)
-    {
-        if (!isEntity(entityAddress)) revert();
-        entityStructs[entityAddress].entityData = entityData;
-        return true;
-    }
-
-    /**************************************************************************
-     * SatisfyFlows Logic
-     *************************************************************************/
-    /// @dev If a new stream is opened, or an existing one is opened
-    function _updateOutflow(
-        bytes calldata ctx,
-        address customer,
-        bytes32 agreementId
-    ) private returns (bytes memory newCtx) {
-        newCtx = ctx;
-        (, int96 inFlowRate, , ) = _cfa.getFlowByID(
-            _acceptedToken,
-            agreementId
-        );
-        (, int96 outFlowRate, , ) = _cfa.getFlow(
-            _sodaToken,
-            address(this),
-            customer
-        );
-        if (inFlowRate < 0) inFlowRate = -inFlowRate; // Fixes issue when inFlowRate is negative
-
-        if (outFlowRate != int96(0)) {
-            // @dev if there already exists an outflow, then update it.
-            (newCtx, ) = _host.callAgreementWithContext(
-                _cfa,
-                abi.encodeWithSelector(
-                    _cfa.updateFlow.selector,
-                    _sodaToken,
-                    customer,
-                    inFlowRate,
-                    new bytes(0) // placeholder
-                ),
-                "0x",
-                newCtx
+    // we calculate the flow rate per year for everyone on the payroll
+    function recalculateFlow() public {
+        int256 _balance = TreasuryBalance();
+        int256 _yearlyBurnPerWeight = ((_balance / 100) * burnPercentage) /
+            totalWeight /
+            _secondsPerYear;
+        DAOReceiver memory currentReceiver = payroll[0];
+        for (uint8 i = 0; i < totalReceivers; i++) {
+            _updateFlow(
+                currentReceiver.receiverAddress,
+                int96((_yearlyBurnPerWeight * currentReceiver.receiverWeight))
             );
-        } else if (inFlowRate == int96(0)) {
-            // @dev if inFlowRate is zero, delete outflow.
-            (newCtx, ) = _host.callAgreementWithContext(
-                _cfa,
-                abi.encodeWithSelector(
-                    _cfa.deleteFlow.selector,
-                    _sodaToken,
-                    address(this),
-                    customer,
-                    new bytes(0) // placeholder
-                ),
-                "0x",
-                newCtx
-            );
-        } else {
-            // @dev If there is no existing outflow, then create new flow to equal inflow
-            (newCtx, ) = _host.callAgreementWithContext(
-                _cfa,
-                abi.encodeWithSelector(
-                    _cfa.createFlow.selector,
-                    _sodaToken,
-                    customer,
-                    inFlowRate,
-                    new bytes(0) // placeholder
-                ),
-                "0x",
-                newCtx
-            );
+            currentReceiver = payroll[i];
         }
     }
 
     /**************************************************************************
-     * SuperApp callbacks
+     * Flows Logic
      *************************************************************************/
-    function afterAgreementCreated(
-        ISuperToken _superToken,
-        address _agreementClass,
-        bytes32 _agreementId,
-        bytes calldata, /*_agreementData*/
-        bytes calldata, // _cbdata,
-        bytes calldata _ctx
-    )
-        external
-        override
-        onlyExpected(_superToken, _agreementClass)
-        onlyHost
-        returns (bytes memory newCtx)
-    {
-        address customer = _host.decodeCtx(_ctx).msgSender;
-        return _updateOutflow(_ctx, customer, _agreementId);
-    }
 
-    function afterAgreementUpdated(
-        ISuperToken _superToken,
-        address _agreementClass,
-        bytes32 _agreementId,
-        bytes calldata, /*_agreementData*/
-        bytes calldata, //_cbdata,
-        bytes calldata _ctx
-    )
-        external
-        override
-        onlyExpected(_superToken, _agreementClass)
-        onlyHost
-        returns (bytes memory newCtx)
-    {
-        address customer = _host.decodeCtx(_ctx).msgSender;
-        return _updateOutflow(_ctx, customer, _agreementId);
-    }
-
-    function afterAgreementTerminated(
-        ISuperToken _superToken,
-        address _agreementClass,
-        bytes32 _agreementId,
-        bytes calldata _agreementData,
-        bytes calldata, //_cbdata,
-        bytes calldata _ctx
-    ) external override onlyHost returns (bytes memory newCtx) {
-        // According to the app basic law, we should never revert in a termination callback
-        if (!_isSameToken(_superToken) || !_isCFAv1(_agreementClass))
-            return _ctx;
-        (address customer, ) = abi.decode(_agreementData, (address, address));
-        return _updateOutflow(_ctx, customer, _agreementId);
-    }
-
-    function getNetFlow() public view returns (int96) {
-        return _cfa.getNetFlow(_acceptedToken, address(this));
-    }
-
-    function _isSameToken(ISuperToken superToken) private view returns (bool) {
-        return address(superToken) == address(_acceptedToken);
-    }
-
-    function _isCFAv1(address agreementClass) private view returns (bool) {
-        return
-            ISuperAgreement(agreementClass).agreementType() ==
-            keccak256(
-                "org.superfluid-finance.agreements.ConstantFlowAgreement.v1"
-            );
-    }
-
-    modifier onlyHost() {
-        require(
-            msg.sender == address(_host),
-            "SatisfyFlows: support only one host"
+    function _createFlow(address newReceiver, int96 flowrate) internal {
+        _host.callAgreement(
+            _cfa,
+            abi.encodeWithSelector(
+                _cfa.createFlow.selector,
+                _acceptedToken,
+                newReceiver,
+                flowrate,
+                new bytes(0)
+            ),
+            "0x"
         );
-        _;
     }
-    modifier onlyExpected(ISuperToken superToken, address agreementClass) {
-        require(_isSameToken(superToken), "SatisfyFlows: not accepted token");
-        require(_isCFAv1(agreementClass), "SatisfyFlows: only CFAv1 supported");
-        _;
+
+    function _updateFlow(address receiver, int96 newFlowrate) internal {
+        _host.callAgreement(
+            _cfa,
+            abi.encodeWithSelector(
+                _cfa.updateFlow.selector,
+                _acceptedToken,
+                receiver,
+                newFlowrate,
+                new bytes(0)
+            ),
+            "0x"
+        );
+    }
+
+    function _deleteFlow(address receiver) internal {
+        _host.callAgreement(
+            _cfa,
+            abi.encodeWithSelector(
+                _cfa.deleteFlow.selector,
+                _acceptedToken,
+                address(this),
+                receiver,
+                new bytes(0)
+            ),
+            "0x"
+        );
     }
 }

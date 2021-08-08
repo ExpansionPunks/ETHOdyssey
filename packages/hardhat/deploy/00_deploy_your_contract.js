@@ -8,7 +8,11 @@ module.exports = async ({ getNamedAccounts, deployments }) => {
   await deploy("YourContract", {
     // Learn more about args here: https://www.npmjs.com/package/hardhat-deploy#deploymentsdeploy
     from: deployer,
-    args: ["0x22ff293e14F1EC3A09B137e9e06084AFd63adDF9", "0xEd6BcbF6907D4feEEe8a8875543249bEa9D308E8", "0x5943F705aBb6834Cad767e6E4bB258Bc48D9C947", "0x88271d333C72e51516B67f5567c728E702b3eeE8"],
+    args: [
+      "0x22ff293e14F1EC3A09B137e9e06084AFd63adDF9",
+      "0xEd6BcbF6907D4feEEe8a8875543249bEa9D308E8",
+      "0x5943F705aBb6834Cad767e6E4bB258Bc48D9C947",
+    ],
     log: true,
   });
 
